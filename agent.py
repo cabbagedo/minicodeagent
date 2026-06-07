@@ -1,0 +1,160 @@
+"""
+MiniCodeAgent · 第 4 步:防失控 + 事件流(工程加固)
+================================================================
+在第 3 步(Docker 沙箱)基础上新增:
+  - 事件流(event sourcing):每步 action/observation 记入 events.jsonl,可回放/审计(= OpenHands 事件系统)
+  - 卡死检测(stuck detection):连续 3 次相同操作即停(= OpenHands stuck_detector)
+  搭配已有的 max_steps,组成"防失控三件套":最大轮数 + 卡死检测 + 沙箱资源限制
+运行: venv/bin/python agent.py
+"""
+
+import json
+import os
+
+import docker
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+client = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")
+
+WORKSPACE = os.path.join(os.path.dirname(__file__), "workspace")
+EVENTS_PATH = os.path.join(os.path.dirname(__file__), "events.jsonl")
+
+
+# ========== 事件流(event sourcing,= OpenHands 事件系统) ==========
+def log_event(step, kind, data):
+    """把每个动作/观察记成一条事件,可回放、可审计"""
+    event = {"step": step, "kind": kind, "data": data}
+    with open(EVENTS_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+# ========== Docker 沙箱(= OpenHands DockerSandboxService) ==========
+class DockerSandbox:
+    def __init__(self, workspace, image="python:3.12-slim"):
+        self.docker = docker.from_env()
+        print(f"🏠 启动沙箱容器（{image}）…")
+        self.container = self.docker.containers.run(
+            image, command="sleep infinity",
+            volumes={workspace: {"bind": "/workspace", "mode": "rw"}},  # 文件隔离
+            working_dir="/workspace", detach=True,
+            mem_limit="512m",      # 资源限制(防失控之一)
+            network_mode="none",   # 断网
+        )
+
+    def exec(self, command):
+        res = self.container.exec_run(["sh", "-c", command], workdir="/workspace")
+        return res.output.decode("utf-8", errors="replace") or "(无输出)"
+
+    def cleanup(self):
+        self.container.stop()
+        self.container.remove()
+        print("🧹 沙箱已清理")
+
+
+sandbox = None
+
+
+# ========== 工具 ==========
+def list_files(path="."):
+    return "\n".join(os.listdir(os.path.join(WORKSPACE, path)))
+
+
+def read_file(filename):
+    with open(os.path.join(WORKSPACE, filename), encoding="utf-8") as f:
+        return f.read()
+
+
+def edit_file(filename, content):
+    with open(os.path.join(WORKSPACE, filename), "w", encoding="utf-8") as f:
+        f.write(content)
+    return f"已写入 {filename}"
+
+
+def run_command(command):
+    return sandbox.exec(command)
+
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "list_files", "description": "列出工作目录下有哪些文件",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "相对目录,默认当前"}}}}},
+    {"type": "function", "function": {
+        "name": "read_file", "description": "读取某个文件的全部内容",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string"}}, "required": ["filename"]}}},
+    {"type": "function", "function": {
+        "name": "edit_file", "description": "用新内容覆盖写入文件(用来改代码)",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string"},
+            "content": {"type": "string", "description": "文件的完整新内容"}},
+            "required": ["filename", "content"]}}},
+    {"type": "function", "function": {
+        "name": "run_command",
+        "description": "在 Docker 沙箱里执行 shell 命令(如 python xxx.py),返回输出和报错",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string"}}, "required": ["command"]}}},
+]
+TOOL_FUNCS = {"list_files": list_files, "read_file": read_file,
+              "edit_file": edit_file, "run_command": run_command}
+
+
+# ========== think-act-observe 循环 ==========
+def run(task, max_steps=15):
+    open(EVENTS_PATH, "w").close()  # 每次运行清空事件日志
+    messages = [
+        {"role": "system", "content":
+            "你是一个编程助手,可以用工具读文件、改文件、在沙箱里跑命令来完成任务。"
+            "修 bug 的标准流程:先读代码 → 跑一次看现象 → 定位 → 改 → 再跑一次验证。"
+            "确认任务完成后直接用文字回答,不要再调用工具。"},
+        {"role": "user", "content": task},
+    ]
+    recent_sigs = []  # 最近的操作签名,用于卡死检测
+
+    for step in range(1, max_steps + 1):  # 防失控①:最大轮数
+        print(f"\n===== 第 {step} 轮 =====")
+        resp = client.chat.completions.create(
+            model="deepseek-chat", messages=messages, tools=TOOLS
+        )
+        msg = resp.choices[0].message
+        messages.append(msg)
+
+        if not msg.tool_calls:  # 完成(FinishTool)
+            log_event(step, "finish", {"answer": msg.content})
+            print("✅ Agent 最终回答:", msg.content)
+            return msg.content
+
+        for call in msg.tool_calls:
+            name = call.function.name
+            args = json.loads(call.function.arguments or "{}")
+
+            # 防失控②:卡死检测——连续 3 次完全相同的操作就停
+            sig = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+            recent_sigs.append(sig)
+            if len(recent_sigs) >= 3 and len(set(recent_sigs[-3:])) == 1:
+                print("🛑 卡死检测:连续 3 次相同操作,提前停止(防失控)")
+                log_event(step, "stuck", {"signature": sig})
+                return None
+
+            log_event(step, "action", {"tool": name, "args": args})  # 事件:动作
+            print(f"🔧 {name}({ {k: str(v)[:50] for k, v in args.items()} })")
+            try:
+                result = TOOL_FUNCS[name](**args)
+            except Exception as e:
+                result = f"工具出错:{e}"
+            log_event(step, "observation", {"tool": name, "result": result[:500]})  # 事件:观察
+            print(f"👀 {result[:200]}")
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+
+    print("⚠️ 达到最大轮数,强制停止")
+
+
+if __name__ == "__main__":
+    sandbox = DockerSandbox(WORKSPACE)
+    try:
+        run("workspace 里的 calc.py 计算阶乘,5! 应该等于 120,但运行结果不对。"
+            "请定位并修复 bug,确保运行后输出正确的 120。")
+    finally:
+        sandbox.cleanup()
