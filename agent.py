@@ -68,10 +68,21 @@ def read_file(filename):
         return f.read()
 
 
-def edit_file(filename, content):
-    with open(os.path.join(WORKSPACE, filename), "w", encoding="utf-8") as f:
-        f.write(content)
-    return f"已写入 {filename}"
+def edit_file(filename, old_str, new_str):
+    """局部替换:把文件里的 old_str 改成 new_str(只改片段,不重写整个文件)。
+    old_str 必须在文件中精确且唯一匹配;找不到 / 匹配多处都返回错误,
+    让模型据此补更多上下文重试(失败信息会作为 observation 回喂模型)。"""
+    path = os.path.join(WORKSPACE, filename)
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    count = text.count(old_str)
+    if count == 0:
+        return f"错误:在 {filename} 里没找到 old_str(注意缩进/空格要完全一致),请核对后重试。"
+    if count > 1:
+        return f"错误:old_str 在 {filename} 里匹配到 {count} 处、不唯一,请在 old_str 多带几行上下文以唯一定位。"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text.replace(old_str, new_str))
+    return f"已修改 {filename}:替换了 1 处"
 
 
 def run_command(command):
@@ -88,11 +99,15 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {
             "filename": {"type": "string"}}, "required": ["filename"]}}},
     {"type": "function", "function": {
-        "name": "edit_file", "description": "用新内容覆盖写入文件(用来改代码)",
+        "name": "edit_file",
+        "description": "局部修改文件:把 old_str 精确替换成 new_str(只改片段、不重写整个文件)。"
+                       "old_str 必须与文件中目标片段完全一致(含缩进)且在文件中唯一;"
+                       "若找不到或匹配多处会报错,需多带上下文重试。",
         "parameters": {"type": "object", "properties": {
             "filename": {"type": "string"},
-            "content": {"type": "string", "description": "文件的完整新内容"}},
-            "required": ["filename", "content"]}}},
+            "old_str": {"type": "string", "description": "要被替换的原始片段(需与文件内容完全一致且唯一)"},
+            "new_str": {"type": "string", "description": "替换后的新片段"}},
+            "required": ["filename", "old_str", "new_str"]}}},
     {"type": "function", "function": {
         "name": "run_command",
         "description": "在 Docker 沙箱里执行 shell 命令(如 python xxx.py),返回输出和报错",
