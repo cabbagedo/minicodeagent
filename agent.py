@@ -231,7 +231,14 @@ def run(task, max_steps=15):
 
         for call in msg.tool_calls:
             name = call.function.name
-            args = json.loads(call.function.arguments or "{}")
+            try:
+                args = json.loads(call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                result = "错误:arguments 不是合法 JSON,请重新生成这次工具调用"
+                log_event(step, "observation", {"tool": name, "result": result})
+                print(f"👀 {result}")
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+                continue
 
             # 防失控②:卡死检测——连续 3 次完全相同的操作就停
             sig = f"{name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
