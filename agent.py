@@ -1,10 +1,12 @@
 """
-MiniCodeAgent · 第 4 步:防失控 + 事件流(工程加固)
+MiniCodeAgent · 第 5 步:上下文管理(逼近工业级 coding agent)
 ================================================================
-在第 3 步(Docker 沙箱)基础上新增:
-  - 事件流(event sourcing):每步 action/observation 记入 events.jsonl,可回放/审计(= OpenHands 事件系统)
-  - 卡死检测(stuck detection):连续 3 次相同操作即停(= OpenHands stuck_detector)
-  搭配已有的 max_steps,组成"防失控三件套":最大轮数 + 卡死检测 + 沙箱资源限制
+第 3 步:Docker 沙箱隔离;第 4 步:事件流 + 卡死检测(防失控)。
+本步新增「上下文管理」,解决长任务把对话历史堆爆模型上下文窗口
+(deepseek-chat 约 64K token)、导致 API 报错 / agent 崩溃的问题:
+  - 上下文压缩器 Condenser:历史超过阈值时,用 LLM 把早期回合总结成「进展摘要」,
+    只保留 系统+初始任务 和 最近几个回合(= OpenHands 的 LLMSummarizingCondenser)
+  - 超长输出截断:单条命令/工具输出过长时只留头尾,防止一条 observation 就撑爆上下文
 运行: venv/bin/python agent.py
 """
 
@@ -101,6 +103,90 @@ TOOL_FUNCS = {"list_files": list_files, "read_file": read_file,
               "edit_file": edit_file, "run_command": run_command}
 
 
+# ========== 上下文管理(= OpenHands 的 Condenser + 输出截断) ==========
+MAX_OBS_CHARS = 4000  # 单条工具/命令输出喂给模型的字符上限
+
+
+def clip_observation(text):
+    """单条 observation 过长时只保留头尾,防止一条输出(如长日志)就撑爆上下文窗口。"""
+    if len(text) <= MAX_OBS_CHARS:
+        return text
+    half = MAX_OBS_CHARS // 2
+    omitted = len(text) - MAX_OBS_CHARS
+    return f"{text[:half]}\n…(输出过长,中间省略 {omitted} 字)…\n{text[-half:]}"
+
+
+class Condenser:
+    """上下文压缩器(= OpenHands 的 LLMSummarizingCondenser)。
+    对话历史变长、逼近模型上下文窗口(deepseek-chat 约 64K token)时,把中间的旧历史
+    用 LLM 总结成一段「进展摘要」,只保留 系统+初始任务 和 最近几个回合,中段换成摘要,
+    防止长任务把 messages 堆爆上下文窗口导致 API 报错。"""
+
+    def __init__(self, client, max_turns=8, keep_recent=3):
+        self.client = client
+        self.max_turns = max_turns      # 历史超过这么多「回合」就触发压缩
+        self.keep_recent = keep_recent  # 压缩时原样保留最近几个回合
+
+    @staticmethod
+    def _role(m):
+        return m["role"] if isinstance(m, dict) else m.role
+
+    def _split_turns(self, messages):
+        """把平铺 messages 切成 head(系统+初始任务) + 若干「回合」。
+        每个回合 = 1 条 assistant + 其后跟随的 tool 结果,自包含不可拆,
+        这样压缩绝不会拆散 tool_calls 与 tool 响应的配对(否则 API 报错)。"""
+        head = messages[:2]
+        turns, cur = [], []
+        for m in messages[2:]:
+            if self._role(m) == "assistant":
+                if cur:
+                    turns.append(cur)
+                cur = [m]
+            else:
+                cur.append(m)
+        if cur:
+            turns.append(cur)
+        return head, turns
+
+    def condense(self, messages, step):
+        head, turns = self._split_turns(messages)
+        if len(turns) <= self.max_turns:
+            return messages  # 没到阈值,原样返回(小任务永远走这条)
+        old, recent = turns[:-self.keep_recent], turns[-self.keep_recent:]
+        summary = self._summarize(old)
+        log_event(step, "condense", {"compressed_turns": len(old), "kept_turns": len(recent)})
+        print(f"🗜️  上下文压缩:早期 {len(old)} 个回合 → 摘要,保留最近 {len(recent)} 个回合")
+        summary_msg = {"role": "user",
+                       "content": f"【历史进展摘要(前 {len(old)} 个回合已压缩,据此继续)】\n{summary}"}
+        return head + [summary_msg] + [m for t in recent for m in t]
+
+    def _summarize(self, old_turns):
+        """把中段历史拍平成文本,让 LLM 浓缩成要点。"""
+        lines = []
+        for t in old_turns:
+            for m in t:
+                if self._role(m) == "assistant":
+                    content = m.content if not isinstance(m, dict) else m.get("content")
+                    if content:
+                        lines.append(f"[思考] {content}")
+                    for tc in (getattr(m, "tool_calls", None) or []):
+                        lines.append(f"[动作] {tc.function.name}({tc.function.arguments[:200]})")
+                else:  # tool 结果
+                    c = m["content"] if isinstance(m, dict) else m.content
+                    lines.append(f"[结果] {c[:300]}")
+        resp = self.client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": "你是上下文压缩器,把编程 agent 的冗长历史浓缩成简明要点。"},
+                {"role": "user", "content":
+                    "请把下面的 agent 历史压缩成进展摘要,务必保留:读过哪些文件、定位到什么 bug、"
+                    "做了哪些修改、命令/报错的关键信息,让 agent 能据此无缝继续任务。\n\n"
+                    + "\n".join(lines)},
+            ],
+        )
+        return resp.choices[0].message.content
+
+
 # ========== think-act-observe 循环 ==========
 def run(task, max_steps=15):
     open(EVENTS_PATH, "w").close()  # 每次运行清空事件日志
@@ -112,9 +198,11 @@ def run(task, max_steps=15):
         {"role": "user", "content": task},
     ]
     recent_sigs = []  # 最近的操作签名,用于卡死检测
+    condenser = Condenser(client)  # 上下文压缩器:防止长任务堆爆上下文窗口
 
     for step in range(1, max_steps + 1):  # 防失控①:最大轮数
         print(f"\n===== 第 {step} 轮 =====")
+        messages = condenser.condense(messages, step)  # 上下文管理:逼近窗口时压缩旧历史
         resp = client.chat.completions.create(
             model="deepseek-chat", messages=messages, tools=TOOLS
         )
@@ -146,7 +234,8 @@ def run(task, max_steps=15):
                 result = f"工具出错:{e}"
             log_event(step, "observation", {"tool": name, "result": result[:500]})  # 事件:观察
             print(f"👀 {result[:200]}")
-            messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+            messages.append({"role": "tool", "tool_call_id": call.id,
+                             "content": clip_observation(result)})  # 截断超长输出,防爆上下文
 
     print("⚠️ 达到最大轮数,强制停止")
 
